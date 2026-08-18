@@ -9,9 +9,9 @@ const TILE = 16
 // exact pixel-density match at the cost of a non-integer row count.)
 const TILE_SCALE = 3
 const TILE_PX = TILE * TILE_SCALE
-const MAP_COLS = 73
+const MAP_COLS = 146
 const MAP_ROWS = 15
-const WORLD_W = MAP_COLS * TILE_PX // 3504
+const WORLD_W = MAP_COLS * TILE_PX // 7008
 const WORLD_H = MAP_ROWS * TILE_PX // 720
 
 const GROUND_ROW = 13
@@ -24,13 +24,36 @@ const TILE_GROUND_TOP = 134 // bright band along the tile top -- floor surface
 const TILE_GROUND_FILL = 96 // riveted panel -- structural mass below
 const TILE_PLATFORM = 135 // grating with strong dividers -- walkway
 
-// Kai's jump clears 169px (520^2 / 2*800), so keep platforms under ~150 up.
+// Kai's jump clears 169px (520^2 / 2*800) and carries ~286px horizontally, so
+// a stand-on ledge must sit under ~150px above whatever he launches from.
+// Underside clearance matters too: a row-10 slab (underside 528) clears both
+// Kai's standing body (top 568) and a bot (top 564); a row-11 slab (underside
+// 576) blocks both -- that is what makes the slide tunnel a real gate.
 const PLATFORMS = [
-  { row: 11, c0: 12, c1: 17 },
-  { row: 10, c0: 24, c1: 29 },
-  { row: 11, c0: 38, c1: 43 },
-  { row: 10, c0: 52, c1: 57 },
+  { row: 11, c0: 14, c1: 19 }, // first hop up off the floor
+  { row: 11, c0: 26, c1: 31 }, // stepping stone...
+  { row: 9, c0: 34, c1: 39 }, // ...to a high ledge (192 off the floor: needs the step)
+  { row: 10, c0: 66, c1: 71 }, // plateau run -- three slabs, two 144px gaps
+  { row: 10, c0: 75, c1: 80 },
+  { row: 10, c0: 84, c1: 89 },
+  { row: 10, c0: 106, c1: 111 }, // second stepping stone...
+  { row: 8, c0: 114, c1: 119 }, // ...to the highest ledge
 ]
+
+// Floor gaps: both ground rows carved out. 144px wide against a 286px jump, so
+// clearing them is comfortable; falling in drops Kai 96px onto the world floor,
+// which his 169px jump can climb back out of. No death pit, no respawn needed.
+const PITS = [
+  { c0: 47, c1: 49 },
+  { c0: 99, c1: 101 },
+]
+
+// Bulkhead: solid from row 6 down to row 11, leaving only row 12 open. Its top
+// (y 288) is far above Kai's 455px jump apex, so it cannot be jumped -- the
+// 48px slot underneath is passable only by the 32px-tall slide body.
+// Kept to 2 columns (96px): a slide covers 172px from a standstill, so the body
+// is fully clear of the overhang before it expands back to full height.
+const SLIDE_TUNNELS = [{ c0: 56, c1: 57, rowTop: 6, rowBottom: 11 }]
 
 const PLAYER_SPAWN_X = 150
 const PLAYER_SPAWN_Y = 400
@@ -89,10 +112,13 @@ const PLAYER_HURT_SHAKE_INTENSITY = 0.01
 // --- objective ---
 const GATE_W = 56
 const GATE_H = 150
-const GATE_X = 3350
+const GATE_X = 6850
 const GATE_TRIGGER_DIST = 110
 
-const SCOUT_SPAWN_XS = [800, 1500, 2200, 2900]
+// Small clusters with breathing room between them, so the level paces as a
+// fight-through rather than one pile. Kept clear of the pits (x 2256-2400,
+// 4752-4848) and the bulkhead (x 2688-2832) so nobody spawns stuck.
+const SCOUT_SPAWN_XS = [900, 1350, 1520, 2600, 3450, 3620, 5100, 6200]
 
 // prefix -> frame count, frameRate, repeat (-1 loops, 0 plays once)
 const ANIMS = {
@@ -216,6 +242,19 @@ export default class BootScene extends Phaser.Scene {
     for (let c = 0; c < MAP_COLS; c++) {
       data[GROUND_ROW][c] = TILE_GROUND_TOP
       for (let r = GROUND_ROW + 1; r < MAP_ROWS; r++) data[r][c] = TILE_GROUND_FILL
+    }
+
+    // Carve the pits back out of the floor.
+    for (const pit of PITS) {
+      for (let c = pit.c0; c <= pit.c1; c++) {
+        for (let r = GROUND_ROW; r < MAP_ROWS; r++) data[r][c] = -1
+      }
+    }
+
+    for (const t of SLIDE_TUNNELS) {
+      for (let c = t.c0; c <= t.c1; c++) {
+        for (let r = t.rowTop; r <= t.rowBottom; r++) data[r][c] = TILE_GROUND_FILL
+      }
     }
 
     for (const p of PLATFORMS) {
