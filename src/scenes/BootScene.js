@@ -29,15 +29,25 @@ const TILE_PLATFORM = 135 // grating with strong dividers -- walkway
 // Underside clearance matters too: a row-10 slab (underside 528) clears both
 // Kai's standing body (top 568) and a bot (top 564); a row-11 slab (underside
 // 576) blocks both -- that is what makes the slide tunnel a real gate.
+// Laid out so no chain of ledges becomes a roof over the fight. Three rules:
+//   1. No slab sits above a bot's x, so none can be waited out from safety.
+//   2. Nothing is lower than row 10, so a slab can never trap a bot walking
+//      under it (underside 528 vs a bot's 564 top).
+//   3. Chains are at most two slabs and always dead-end into a drop back to the
+//      floor, so the route forward runs through the bots rather than over them.
+// Reach: row 10 (144 up) is a standing jump off the floor; rows 9 and 8 are
+// only reachable by stepping off a row-10 slab.
 const PLATFORMS = [
-  { row: 11, c0: 14, c1: 19 }, // first hop up off the floor
-  { row: 11, c0: 26, c1: 31 }, // stepping stone...
-  { row: 9, c0: 34, c1: 39 }, // ...to a high ledge (192 off the floor: needs the step)
-  { row: 10, c0: 66, c1: 71 }, // plateau run -- three slabs, two 144px gaps
-  { row: 10, c0: 75, c1: 80 },
-  { row: 10, c0: 84, c1: 89 },
-  { row: 10, c0: 106, c1: 111 }, // second stepping stone...
-  { row: 8, c0: 114, c1: 119 }, // ...to the highest ledge
+  { row: 10, c0: 22, c1: 25 }, // 1056-1200
+  { row: 10, c0: 36, c1: 39 }, // 1728-1872, step up to...
+  { row: 9, c0: 42, c1: 45 }, // 2016-2208, dead-ends past the first pit
+  { row: 10, c0: 50, c1: 52 }, // 2400-2544, landing after the pit
+  { row: 10, c0: 62, c1: 64 }, // 2976-3120, past the slide tunnel, step up to...
+  { row: 9, c0: 67, c1: 70 }, // 3216-3408, dead-ends before the 3450/3620 pair
+  { row: 10, c0: 78, c1: 81 }, // 3744-3936
+  { row: 10, c0: 92, c1: 94 }, // 4416-4512
+  { row: 10, c0: 108, c1: 110 }, // 5184-5280, step up to...
+  { row: 8, c0: 112, c1: 116 }, // 5376-5616, highest ledge, dead-ends before the gate
 ]
 
 // Floor gaps: both ground rows carved out. 144px wide against a 286px jump, so
@@ -205,7 +215,7 @@ export default class BootScene extends Phaser.Scene {
     this.slideEndsAt = 0
     this.playerFrozen = false
     this.blinkTween = null
-    this.gateReached = false
+    this.gateOpen = false
     this.hitThisSwing = new Set()
 
     // --- UI ---
@@ -228,6 +238,10 @@ export default class BootScene extends Phaser.Scene {
     }
     this.physics.add.collider(this.enemies, this.groundLayer)
     this.physics.add.collider(this.player, this.enemies)
+
+    // The gate is only actually solid because of this collider -- a static body
+    // on its own is never consulted. Torn down when the level is cleared.
+    this.gateCollider = this.physics.add.collider(this.player, this.gate)
 
     this.physics.add.overlap(this.hitbox, this.enemies, (_hb, enemy) => this.onBladeHit(enemy))
     this.physics.add.overlap(this.player, this.enemyHitboxes, (_p, hb) => this.onEnemyHit(hb))
@@ -548,8 +562,62 @@ export default class BootScene extends Phaser.Scene {
 
   // ---------- objective ----------
 
-  reachGate() {
-    this.gateReached = true
+  /** A bot counts as cleared the moment its HP hits 0, not when it finishes exploding. */
+  botsRemaining() {
+    return this.enemies.getChildren().filter((bot) => !bot.dead).length
+  }
+
+  updateGate() {
+    if (this.gateOpen) return
+
+    const remaining = this.botsRemaining()
+    if (remaining === 0) {
+      this.openGate()
+      return
+    }
+
+    const atGate = Math.abs(this.player.x - GATE_X) < GATE_TRIGGER_DIST
+    this.showSealedHint(atGate, remaining)
+  }
+
+  showSealedHint(visible, remaining) {
+    if (!this.sealedText) {
+      this.sealedText = this.add
+        .text(this.scale.width / 2, 120, '', {
+          fontFamily: 'monospace',
+          fontSize: '26px',
+          color: '#ffc46b',
+          align: 'center',
+        })
+        .setOrigin(0.5)
+        .setScrollFactor(0)
+        .setDepth(1001)
+    }
+    this.sealedText.setVisible(visible)
+    if (visible) {
+      this.sealedText.setText(
+        `The gate is sealed — clear the bots\n${remaining} remaining`
+      )
+    }
+  }
+
+  openGate() {
+    this.gateOpen = true
+    this.sealedText?.setVisible(false)
+
+    if (this.gateCollider) {
+      this.gateCollider.destroy()
+      this.gateCollider = null
+    }
+    this.gate.body.enable = false
+    this.tweens.add({
+      targets: this.gate,
+      y: this.gate.y - (GATE_H + 24),
+      alpha: 0.3,
+      duration: 700,
+      ease: 'Cubic.easeOut',
+    })
+
     this.gateText = this.add
       .text(this.scale.width / 2, 120, 'GATE OPENING', {
         fontFamily: 'monospace',
@@ -573,15 +641,13 @@ export default class BootScene extends Phaser.Scene {
       return
     }
 
+    this.updateGate()
+
     if (this.playerFrozen) return
 
     const player = this.player
     const body = player.body
     const onGround = body.blocked.down || body.touching.down
-
-    if (!this.gateReached && Math.abs(player.x - GATE_X) < GATE_TRIGGER_DIST) {
-      this.reachGate()
-    }
 
     // No input while the hurt animation is committed; knockback carries.
     if (this.isHurt) return
