@@ -104,6 +104,14 @@ const FLASH_MS = 90
 const DIE_ANIM_MS = 700
 const DEATH_PROMPT_DELAY_MS = 450
 
+// Fall death. collideWorldBounds pins Kai to the world floor, so dropping into
+// a pit bottoms him out at y=722 -- he can never get below the map, and a kill
+// line "under the level" would never fire. This one sits inside the pit
+// instead: 64px below where he stands on the floor (626) and 32px above the pit
+// bottom. Every platform is higher than the floor, so passing this line can
+// only mean he has dropped into a gap.
+const FALL_KILL_Y = GROUND_TOP_Y + 66 // 690
+
 const HITSTOP_MS = 70
 const SHAKE_MS = 120
 const SHAKE_INTENSITY = 0.006
@@ -487,6 +495,13 @@ export default class BootScene extends Phaser.Scene {
     if (this.player?.active) this.player.setAlpha(1)
   }
 
+  /** Falling costs everything, so empty the bar before the shared death flow. */
+  killByFall() {
+    this.playerHp = 0
+    this.healthBar.setValue(0, PLAYER_MAX_HP)
+    this.killPlayer()
+  }
+
   killPlayer() {
     this.playerDead = true
     this.player.isDeadPlayer = true
@@ -550,7 +565,15 @@ export default class BootScene extends Phaser.Scene {
   // ---------- loop ----------
 
   update() {
-    if (this.playerDead || this.playerFrozen) return
+    if (this.playerDead) return
+
+    // Dropped into a gap -- same death flow as running out of HP.
+    if (this.player.y > FALL_KILL_Y) {
+      this.killByFall()
+      return
+    }
+
+    if (this.playerFrozen) return
 
     const player = this.player
     const body = player.body
