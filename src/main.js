@@ -23,4 +23,12 @@ const config = {
   scene: [BootScene],
 }
 
-export default new Phaser.Game(config)
+const game = new Phaser.Game(config)
+
+// Dev-only handle so the running game can be poked from the browser console
+// (or an automated check). Stripped from production builds by Vite.
+if (import.meta.env.DEV) {
+  window.game = game
+}
+
+export default game
