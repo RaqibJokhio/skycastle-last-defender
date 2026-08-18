@@ -21,6 +21,18 @@ const KNOCKBACK_X = 200
 const KNOCKBACK_Y = -130
 const FLASH_MS = 90
 
+// --- attack ---
+const MELEE_RANGE = 40
+const ATTACK_COOLDOWN_MS = 1500
+// The 10-frame attack is a three-lunge flurry: 0-2 windup, 3-4 / 6 / 8 extend
+// (art reaches x~53-57), 5 / 7 / 9 retract. All three lunges are live, but
+// hasHitThisAttack keeps a single attack to a single point of damage.
+const ATTACK_ACTIVE_FRAMES = [3, 4, 6, 8]
+const ATTACK_HITBOX_W = 44
+const ATTACK_HITBOX_H = 40
+const ATTACK_HITBOX_OFFSET_X = 38
+const ATTACK_HITBOX_OFFSET_Y = -30
+
 export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
   constructor(scene, x, y, target) {
     super(scene, x, y, 'scout-wake', 0)
@@ -34,6 +46,8 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
     this.frozen = false
     this.aiState = 'dormant'
     this.pendingKnockback = null
+    this.attackReadyAt = 0
+    this.hasHitThisAttack = false
 
     this.setOrigin(ART_CENTER_X / SCOUT_FRAME_W, 1)
     this.setScale(SCALE)
@@ -43,18 +57,53 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
 
     this.setFrame(0)
 
+    // Own hitbox so several bots can swing independently. The scene groups
+    // these and runs one overlap against the player.
+    this.attackHitbox = scene.add.zone(x, y, ATTACK_HITBOX_W, ATTACK_HITBOX_H)
+    scene.physics.add.existing(this.attackHitbox)
+    this.attackHitbox.body.setAllowGravity(false)
+    this.attackHitbox.body.enable = false
+    this.attackHitbox.owner = this
+
     this.on(Phaser.Animations.Events.ANIMATION_COMPLETE, this.onAnimComplete, this)
+    this.on(Phaser.Animations.Events.ANIMATION_UPDATE, this.onAnimUpdate, this)
+  }
+
+  onAnimUpdate(anim, frame) {
+    if (anim.key !== 'scout-attack') return
+    this.setAttackHitboxActive(ATTACK_ACTIVE_FRAMES.includes(frame.index - 1))
   }
 
   onAnimComplete(anim) {
-    if (anim.key === 'scout-wake' && !this.dead) {
-      this.aiState = 'chase'
-    } else if (anim.key === 'scout-hurt' && !this.dead) {
-      this.aiState = 'chase'
-    } else if (anim.key === 'scout-death') {
+    if (anim.key === 'scout-death') {
       this.body.enable = false
       this.destroy()
+      return
     }
+    if (this.dead) return
+
+    if (anim.key === 'scout-attack') {
+      this.setAttackHitboxActive(false)
+      this.attackReadyAt = this.scene.time.now + ATTACK_COOLDOWN_MS
+      this.aiState = 'chase'
+    } else if (anim.key === 'scout-wake' || anim.key === 'scout-hurt') {
+      this.aiState = 'chase'
+    }
+  }
+
+  setAttackHitboxActive(active) {
+    if (!this.attackHitbox) return
+    if (active) this.positionAttackHitbox()
+    this.attackHitbox.body.enable = active
+  }
+
+  positionAttackHitbox() {
+    const dir = this.flipX ? -1 : 1
+    this.attackHitbox.setPosition(
+      this.x + dir * ATTACK_HITBOX_OFFSET_X,
+      this.y + ATTACK_HITBOX_OFFSET_Y
+    )
+    this.attackHitbox.body.reset(this.attackHitbox.x, this.attackHitbox.y)
   }
 
   preUpdate(time, delta) {
@@ -62,13 +111,20 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
 
     if (this.dead || this.frozen || !this.body) return
 
-    // Hurt/wake are committed animations -- hold still until they finish.
+    if (this.aiState === 'attacking') {
+      this.setVelocityX(0)
+      if (this.attackHitbox.body.enable) this.positionAttackHitbox()
+      return
+    }
+
+    // Wake and hurt are committed animations -- hold still until they finish.
     if (this.aiState === 'waking' || this.aiState === 'hurt') {
       this.setVelocityX(0)
       return
     }
 
-    const dist = Math.abs(this.target.x - this.x)
+    const dx = this.target.x - this.x
+    const dist = Math.abs(dx)
 
     if (this.aiState === 'dormant') {
       this.setVelocityX(0)
@@ -80,9 +136,18 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
     }
 
     // chase
-    const dir = Math.sign(this.target.x - this.x) || 1
-    this.setVelocityX(dir * MOVE_SPEED)
+    const dir = Math.sign(dx) || 1
     this.setFlipX(dir < 0)
+
+    if (dist <= MELEE_RANGE && time >= this.attackReadyAt && !this.target.isDeadPlayer) {
+      this.aiState = 'attacking'
+      this.hasHitThisAttack = false
+      this.setVelocityX(0)
+      this.play('scout-attack')
+      return
+    }
+
+    this.setVelocityX(dir * MOVE_SPEED)
     if (this.anims.currentAnim?.key !== 'scout-run') this.play('scout-run')
   }
 
@@ -97,6 +162,9 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
     this.scene.time.delayedCall(FLASH_MS, () => {
       if (this.active) this.clearTint()
     })
+
+    // Getting hit interrupts a swing in progress.
+    this.setAttackHitboxActive(false)
 
     // Queued rather than applied now: the scene freezes us for hitstop first,
     // and releasing INTO the knockback is what gives the hit its pop.
@@ -138,5 +206,13 @@ export default class ScoutBot extends Phaser.Physics.Arcade.Sprite {
     } else {
       this.body.setVelocity(this.savedVelocity.x, this.savedVelocity.y)
     }
+  }
+
+  destroy(fromScene) {
+    if (this.attackHitbox) {
+      this.attackHitbox.destroy()
+      this.attackHitbox = null
+    }
+    super.destroy(fromScene)
   }
 }
