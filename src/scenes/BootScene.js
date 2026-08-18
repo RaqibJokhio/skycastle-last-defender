@@ -2,11 +2,38 @@ import Phaser from 'phaser'
 import ScoutBot, { SCOUT_FRAME_W, SCOUT_FRAME_H } from '../enemies/ScoutBot.js'
 import HealthBar from '../ui/HealthBar.js'
 
-const GROUND_HEIGHT = 64
-const GROUND_COLOR = 0x2a3050
+// --- tilemap ---
+const TILE = 16
+// 3x divides the 720px viewport into exactly 15 rows, so the camera never has
+// to scroll vertically. (Tile pixels render 3x vs Kai's 2x; drop to 2 for an
+// exact pixel-density match at the cost of a non-integer row count.)
+const TILE_SCALE = 3
+const TILE_PX = TILE * TILE_SCALE
+const MAP_COLS = 73
+const MAP_ROWS = 15
+const WORLD_W = MAP_COLS * TILE_PX // 3504
+const WORLD_H = MAP_ROWS * TILE_PX // 720
 
-const PLAYER_SPAWN_X = 200
-const PLAYER_SPAWN_Y = 300
+const GROUND_ROW = 13
+const GROUND_TOP_Y = GROUND_ROW * TILE_PX // 624
+
+// Indices into the 32-col tileset (index = row * 32 + col). All fully opaque.
+// Picked for how they look TILED: the plain panels (33/65/97) are featureless
+// and read as one grey slab once repeated, so these have visible seams.
+const TILE_GROUND_TOP = 134 // bright band along the tile top -- floor surface
+const TILE_GROUND_FILL = 96 // riveted panel -- structural mass below
+const TILE_PLATFORM = 135 // grating with strong dividers -- walkway
+
+// Kai's jump clears 169px (520^2 / 2*800), so keep platforms under ~150 up.
+const PLATFORMS = [
+  { row: 11, c0: 12, c1: 17 },
+  { row: 10, c0: 24, c1: 29 },
+  { row: 11, c0: 38, c1: 43 },
+  { row: 10, c0: 52, c1: 57 },
+]
+
+const PLAYER_SPAWN_X = 150
+const PLAYER_SPAWN_Y = 400
 const PLAYER_SCALE = 2
 
 // Every adventurer frame is a 50x37 canvas with the character padded inside it.
@@ -21,6 +48,13 @@ const BODY_W = 20
 const BODY_H = 28
 const BODY_OFFSET_X = (FRAME_W - BODY_W) / 2
 const BODY_OFFSET_Y = FRAME_H - 1 - BODY_H
+
+// Slide keeps the same body bottom so shrinking it can't drop Kai through the
+// floor -- only the top comes down.
+const SLIDE_BODY_H = 16
+const SLIDE_BODY_OFFSET_Y = FRAME_H - 1 - SLIDE_BODY_H
+const SLIDE_SPEED = 430
+const SLIDE_MS = 400
 
 const MOVE_SPEED = 220
 const JUMP_VELOCITY = -520
@@ -44,7 +78,6 @@ const PLAYER_KNOCKBACK_X = 260
 const PLAYER_KNOCKBACK_Y = -200
 const FLASH_MS = 90
 
-// die anim is 7 frames @ 10fps, then a beat before the prompt appears.
 const DIE_ANIM_MS = 700
 const DEATH_PROMPT_DELAY_MS = 450
 
@@ -53,7 +86,13 @@ const SHAKE_MS = 120
 const SHAKE_INTENSITY = 0.006
 const PLAYER_HURT_SHAKE_INTENSITY = 0.01
 
-const SCOUT_SPAWN_XS = [650, 900, 1120]
+// --- objective ---
+const GATE_W = 56
+const GATE_H = 150
+const GATE_X = 3350
+const GATE_TRIGGER_DIST = 110
+
+const SCOUT_SPAWN_XS = [800, 1500, 2200, 2900]
 
 // prefix -> frame count, frameRate, repeat (-1 loops, 0 plays once)
 const ANIMS = {
@@ -61,6 +100,7 @@ const ANIMS = {
   run: { prefix: 'run', count: 6, frameRate: 12, repeat: -1 },
   jump: { prefix: 'jump', count: 4, frameRate: 10, repeat: 0 },
   fall: { prefix: 'fall', count: 2, frameRate: 8, repeat: -1 },
+  slide: { prefix: 'slide', count: 2, frameRate: 8, repeat: -1 },
   attack: { prefix: 'attack1', count: 5, frameRate: 14, repeat: 0 },
   hurt: { prefix: 'hurt', count: 3, frameRate: 10, repeat: 0 },
   die: { prefix: 'die', count: 7, frameRate: 10, repeat: 0 },
@@ -96,29 +136,22 @@ export default class BootScene extends Phaser.Scene {
         frameHeight: SCOUT_FRAME_H,
       })
     }
+
+    this.load.image('robot-tiles', 'assets/tileset/0x72_16x16RobotTileset.v1.png')
   }
 
   create() {
-    const { width, height } = this.scale
-    this.groundTop = height - GROUND_HEIGHT
+    this.physics.world.setBounds(0, 0, WORLD_W, WORLD_H)
+    this.cameras.main.setBounds(0, 0, WORLD_W, WORLD_H)
 
-    const ground = this.add.rectangle(
-      width / 2,
-      height - GROUND_HEIGHT / 2,
-      width,
-      GROUND_HEIGHT,
-      GROUND_COLOR
-    )
-    this.physics.add.existing(ground, true)
-    this.ground = ground
-
+    this.buildLevel()
     this.createAnimations()
 
     // --- player ---
     this.player = this.physics.add.sprite(PLAYER_SPAWN_X, PLAYER_SPAWN_Y, 'adventurer-idle-00')
     this.player.setOrigin(0.5, 1)
     this.player.setScale(PLAYER_SCALE)
-    this.player.body.setSize(BODY_W, BODY_H)
+    this.player.body.setSize(BODY_W, BODY_H, false)
     this.player.body.setOffset(BODY_OFFSET_X, BODY_OFFSET_Y)
     this.player.body.setCollideWorldBounds(true)
     // Bots stop against Kai instead of shoving him around. `pushable` is a
@@ -126,7 +159,7 @@ export default class BootScene extends Phaser.Scene {
     this.player.body.pushable = false
     this.player.play('idle')
 
-    this.physics.add.collider(this.player, ground)
+    this.physics.add.collider(this.player, this.groundLayer)
 
     this.playerHp = PLAYER_MAX_HP
     this.playerDead = false
@@ -134,8 +167,11 @@ export default class BootScene extends Phaser.Scene {
     this.playerInvulnUntil = 0
     this.isAttacking = false
     this.isHurt = false
+    this.isSliding = false
+    this.slideEndsAt = 0
     this.playerFrozen = false
     this.blinkTween = null
+    this.gateReached = false
     this.hitThisSwing = new Set()
 
     // --- UI ---
@@ -152,11 +188,11 @@ export default class BootScene extends Phaser.Scene {
     this.enemies = this.add.group()
     this.enemyHitboxes = this.add.group()
     for (const x of SCOUT_SPAWN_XS) {
-      const bot = new ScoutBot(this, x, this.groundTop, this.player)
+      const bot = new ScoutBot(this, x, GROUND_TOP_Y, this.player)
       this.enemies.add(bot)
       this.enemyHitboxes.add(bot.attackHitbox)
     }
-    this.physics.add.collider(this.enemies, ground)
+    this.physics.add.collider(this.enemies, this.groundLayer)
     this.physics.add.collider(this.player, this.enemies)
 
     this.physics.add.overlap(this.hitbox, this.enemies, (_hb, enemy) => this.onBladeHit(enemy))
@@ -167,6 +203,37 @@ export default class BootScene extends Phaser.Scene {
 
     this.cursors = this.input.keyboard.createCursorKeys()
     this.attackKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.F)
+    this.slideKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE)
+
+    // Follow horizontally; WORLD_H equals the viewport, so Y stays pinned at 0.
+    this.cameras.main.startFollow(this.player, true, 0.12, 0.12)
+  }
+
+  buildLevel() {
+    // Blank map, then stamp ground and platforms into the 2D index array.
+    const data = Array.from({ length: MAP_ROWS }, () => new Array(MAP_COLS).fill(-1))
+
+    for (let c = 0; c < MAP_COLS; c++) {
+      data[GROUND_ROW][c] = TILE_GROUND_TOP
+      for (let r = GROUND_ROW + 1; r < MAP_ROWS; r++) data[r][c] = TILE_GROUND_FILL
+    }
+
+    for (const p of PLATFORMS) {
+      for (let c = p.c0; c <= p.c1; c++) data[p.row][c] = TILE_PLATFORM
+    }
+
+    this.map = this.make.tilemap({ data, tileWidth: TILE, tileHeight: TILE })
+    const tileset = this.map.addTilesetImage('robot-tiles', 'robot-tiles', TILE, TILE, 0, 0)
+    this.groundLayer = this.map.createLayer(0, tileset, 0, 0)
+    this.groundLayer.setScale(TILE_SCALE)
+    this.groundLayer.setCollisionByExclusion([-1])
+
+    // --- the gate: closed, solid, and the mission goal ---
+    this.gate = this.add
+      .rectangle(GATE_X, GROUND_TOP_Y, GATE_W, GATE_H, 0xd8802a)
+      .setOrigin(0.5, 1)
+      .setStrokeStyle(3, 0xffc46b)
+    this.physics.add.existing(this.gate, true)
   }
 
   createAnimations() {
@@ -292,6 +359,31 @@ export default class BootScene extends Phaser.Scene {
     this.player.anims.resume()
   }
 
+  // ---------- slide ----------
+
+  startSlide() {
+    this.isSliding = true
+    this.slideEndsAt = this.time.now + SLIDE_MS
+
+    const dir = this.player.flipX ? -1 : 1
+    this.player.body.setVelocityX(dir * SLIDE_SPEED)
+
+    // Bottom stays put; only the top of the body drops.
+    this.player.body.setSize(BODY_W, SLIDE_BODY_H, false)
+    this.player.body.setOffset(BODY_OFFSET_X, SLIDE_BODY_OFFSET_Y)
+
+    // Dodge i-frames for the duration of the slide.
+    this.playerInvulnUntil = Math.max(this.playerInvulnUntil, this.slideEndsAt)
+    this.player.play('slide')
+  }
+
+  endSlide() {
+    if (!this.isSliding) return
+    this.isSliding = false
+    this.player.body.setSize(BODY_W, BODY_H, false)
+    this.player.body.setOffset(BODY_OFFSET_X, BODY_OFFSET_Y)
+  }
+
   // ---------- taking damage ----------
 
   onEnemyHit(hitbox) {
@@ -317,9 +409,10 @@ export default class BootScene extends Phaser.Scene {
 
     const dir = Math.sign(this.player.x - fromX) || 1
 
-    // A hit cancels whatever swing was in progress.
+    // A hit cancels whatever swing or slide was in progress.
     this.isAttacking = false
     this.setHitboxActive(false)
+    this.endSlide()
 
     if (this.playerHp <= 0) {
       this.killPlayer()
@@ -360,6 +453,7 @@ export default class BootScene extends Phaser.Scene {
     this.player.isDeadPlayer = true
     this.isHurt = false
     this.playerFrozen = false
+    this.endSlide()
     this.stopBlink()
     this.setHitboxActive(false)
     this.player.body.setVelocity(0, 0)
@@ -398,6 +492,22 @@ export default class BootScene extends Phaser.Scene {
     this.input.keyboard.once('keydown', () => this.scene.restart())
   }
 
+  // ---------- objective ----------
+
+  reachGate() {
+    this.gateReached = true
+    this.gateText = this.add
+      .text(this.scale.width / 2, 120, 'GATE OPENING', {
+        fontFamily: 'monospace',
+        fontSize: '44px',
+        color: '#ffc46b',
+        fontStyle: 'bold',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(1001)
+  }
+
   // ---------- loop ----------
 
   update() {
@@ -407,8 +517,27 @@ export default class BootScene extends Phaser.Scene {
     const body = player.body
     const onGround = body.blocked.down || body.touching.down
 
+    if (!this.gateReached && Math.abs(player.x - GATE_X) < GATE_TRIGGER_DIST) {
+      this.reachGate()
+    }
+
     // No input while the hurt animation is committed; knockback carries.
     if (this.isHurt) return
+
+    if (this.isSliding) {
+      if (this.time.now >= this.slideEndsAt) this.endSlide()
+      else return // movement locked for the duration of the slide
+    }
+
+    if (
+      Phaser.Input.Keyboard.JustDown(this.slideKey) &&
+      onGround &&
+      !this.isAttacking &&
+      !this.isSliding
+    ) {
+      this.startSlide()
+      return
+    }
 
     if (Phaser.Input.Keyboard.JustDown(this.attackKey) && !this.isAttacking) {
       this.startAttack()
