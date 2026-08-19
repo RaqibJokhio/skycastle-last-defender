@@ -6,14 +6,18 @@ const DEPTH = 1000
 const COLOR_HEALTHY = 0x46d17b
 const COLOR_WARN = 0xe0b341
 const COLOR_CRITICAL = 0xdc4b4b
+export const COLOR_BOSS = 0xc2352f
 
 /**
  * A bordered bar pinned to the camera (scrollFactor 0), so it stays put once
  * the camera starts following the player in a later step.
  */
 export default class HealthBar {
-  constructor(scene, x, y, width, height, label = 'KAI') {
+  /** fixedColor keeps a bar one colour instead of ramping -- a boss bar should
+   *  read as hostile at full health, not as a friendly green. */
+  constructor(scene, x, y, width, height, label = 'KAI', fixedColor = null) {
     this.label = label
+    this.fixedColor = fixedColor
     this.maxFillWidth = width - PAD * 2
     this.fillHeight = height - PAD * 2
 
@@ -47,8 +51,8 @@ export default class HealthBar {
       this.fill.setSize(this.maxFillWidth * ratio, this.fillHeight)
     }
 
-    const color = ratio > 0.5 ? COLOR_HEALTHY : ratio > 0.25 ? COLOR_WARN : COLOR_CRITICAL
-    this.fill.setFillStyle(color)
+    const ramped = ratio > 0.5 ? COLOR_HEALTHY : ratio > 0.25 ? COLOR_WARN : COLOR_CRITICAL
+    this.fill.setFillStyle(this.fixedColor ?? ramped)
     this.text.setText(`${this.label}  ${Math.ceil(current)} / ${max}`)
   }
 

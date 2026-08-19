@@ -1,6 +1,8 @@
 import Phaser from 'phaser'
 import ScoutBot, { SCOUT_FRAME_W, SCOUT_FRAME_H } from '../enemies/ScoutBot.js'
-import HealthBar from '../ui/HealthBar.js'
+import Gatekeeper, { GATEKEEPER_MAX_HP } from '../enemies/Gatekeeper.js'
+import HealthBar, { COLOR_BOSS } from '../ui/HealthBar.js'
+import DialogueBox from '../ui/DialogueBox.js'
 
 // --- tilemap ---
 const TILE = 16
@@ -138,6 +140,22 @@ const GATE_TRIGGER_DIST = 110
 // 4752-4848) and the bulkhead (x 2688-2832) so nobody spawns stuck.
 const SCOUT_SPAWN_XS = [900, 1350, 1520, 2600, 3450, 3620, 5100, 6200]
 
+// The Gatekeeper plants itself in front of the gate, so clearing the level
+// means going through it rather than around it.
+const BOSS_SPAWN_X = GATE_X - 190
+
+const INTRO_LINES = [
+  { speaker: 'BIT', text: "Kai, the gate's sealed. Clear these Scout Bots and I'll get it open." },
+  { speaker: 'BIT', text: 'Press F to swing your blade. SPACE slides — use it to dodge through things.' },
+]
+const BOSS_LINES = [
+  { speaker: 'BIT', text: 'Bots down — but something heavy just spun up at the gate. GATEKEEPER class.' },
+  { speaker: 'BIT', text: "Front plating will shrug you off. Hit it when its guard drops — or get behind it." },
+]
+const OVERRIDE_LINES = [
+  { speaker: 'OVERRIDE', text: 'One human remains. Correcting the error.' },
+]
+
 // prefix -> frame count, frameRate, repeat (-1 loops, 0 plays once)
 const ANIMS = {
   idle: { prefix: 'idle', count: 4, frameRate: 8, repeat: -1 },
@@ -216,6 +234,9 @@ export default class BootScene extends Phaser.Scene {
     this.playerFrozen = false
     this.blinkTween = null
     this.gateOpen = false
+    this.missionPhase = 'bots' // 'bots' -> 'boss' -> 'complete'
+    this.boss = null
+    this.bossBar = null
     this.hitThisSwing = new Set()
 
     // --- UI ---
@@ -236,8 +257,15 @@ export default class BootScene extends Phaser.Scene {
       this.enemies.add(bot)
       this.enemyHitboxes.add(bot.attackHitbox)
     }
+    // Registered empty: Phaser group colliders pick up children added later, so
+    // the Gatekeeper needs no extra wiring when it spawns mid-level.
+    this.bosses = this.add.group()
+
     this.physics.add.collider(this.enemies, this.groundLayer)
     this.physics.add.collider(this.player, this.enemies)
+    this.physics.add.collider(this.bosses, this.groundLayer)
+    this.physics.add.collider(this.player, this.bosses)
+    this.physics.add.overlap(this.hitbox, this.bosses, (_hb, boss) => this.onBladeHit(boss))
 
     // The gate is only actually solid because of this collider -- a static body
     // on its own is never consulted. Torn down when the level is cleared.
@@ -255,6 +283,14 @@ export default class BootScene extends Phaser.Scene {
 
     // Follow horizontally; WORLD_H equals the viewport, so Y stays pinned at 0.
     this.cameras.main.startFollow(this.player, true, 0.12, 0.12)
+
+    this.dialogue = new DialogueBox(this)
+    this.showDialogue(INTRO_LINES)
+  }
+
+  /** showDialogue([{ speaker, text }, ...], onDone?) -- BIT and OVERRIDE styles. */
+  showDialogue(lines, onDone = null) {
+    this.dialogue.show(lines, onDone)
   }
 
   buildLevel() {
@@ -452,7 +488,8 @@ export default class BootScene extends Phaser.Scene {
     if (!bot || bot.hasHitThisAttack) return
     // Spent either way: a swing that lands during i-frames is a wasted swing.
     bot.hasHitThisAttack = true
-    this.damagePlayer(ENEMY_DAMAGE, bot.x)
+    // The Gatekeeper hits for more than a Scout, so the attacker owns the number.
+    this.damagePlayer(bot.contactDamage ?? ENEMY_DAMAGE, bot.x)
   }
 
   damagePlayer(amount, fromX) {
@@ -568,22 +605,31 @@ export default class BootScene extends Phaser.Scene {
   }
 
   updateGate() {
-    if (this.gateOpen) return
+    if (this.missionPhase === 'complete') return
 
-    const remaining = this.botsRemaining()
-    if (remaining === 0) {
-      this.openGate()
+    const atGate = Math.abs(this.player.x - GATE_X) < GATE_TRIGGER_DIST
+
+    if (this.missionPhase === 'bots') {
+      const remaining = this.botsRemaining()
+      if (remaining === 0) {
+        this.startBossPhase()
+        return
+      }
+      this.showSealedHint(atGate, `The gate is sealed — clear the bots\n${remaining} remaining`)
       return
     }
 
-    const atGate = Math.abs(this.player.x - GATE_X) < GATE_TRIGGER_DIST
-    this.showSealedHint(atGate, remaining)
+    // Boss phase: the gate stays shut for as long as the Gatekeeper stands.
+    if (this.boss && !this.boss.dead) {
+      this.bossBar?.setValue(this.boss.hp, GATEKEEPER_MAX_HP)
+      this.showSealedHint(atGate, 'The gate is sealed — the GATEKEEPER holds it')
+    }
   }
 
-  showSealedHint(visible, remaining) {
+  showSealedHint(visible, message) {
     if (!this.sealedText) {
       this.sealedText = this.add
-        .text(this.scale.width / 2, 120, '', {
+        .text(this.scale.width / 2, 150, '', {
           fontFamily: 'monospace',
           fontSize: '26px',
           color: '#ffc46b',
@@ -594,12 +640,65 @@ export default class BootScene extends Phaser.Scene {
         .setDepth(1001)
     }
     this.sealedText.setVisible(visible)
-    if (visible) {
-      this.sealedText.setText(
-        `The gate is sealed — clear the bots\n${remaining} remaining`
-      )
-    }
+    if (visible) this.sealedText.setText(message)
   }
+
+  // ---------- boss phase ----------
+
+  startBossPhase() {
+    this.missionPhase = 'boss'
+    this.showDialogue(BOSS_LINES)
+
+    this.boss = new Gatekeeper(this, BOSS_SPAWN_X, GROUND_TOP_Y, this.player)
+    this.boss.onDefeated = () => this.onBossDefeated()
+    this.bosses.add(this.boss)
+    this.enemyHitboxes.add(this.boss.attackHitbox)
+
+    this.bossBar = new HealthBar(this, 340, 24, 600, 24, 'GATEKEEPER', COLOR_BOSS)
+    this.bossBar.setValue(GATEKEEPER_MAX_HP, GATEKEEPER_MAX_HP)
+  }
+
+  onBossDefeated() {
+    this.missionPhase = 'complete'
+    this.boss = null
+    this.sealedText?.setVisible(false)
+    this.bossBar?.setValue(0, GATEKEEPER_MAX_HP)
+
+    // OVERRIDE speaks for the first time, then the way out finally opens.
+    this.showDialogue(OVERRIDE_LINES, () => {
+      this.bossBar?.destroy()
+      this.bossBar = null
+      this.openGate()
+      this.time.delayedCall(1000, () => this.showMissionComplete())
+    })
+  }
+
+  showMissionComplete() {
+    const cx = this.scale.width / 2
+    const cy = this.scale.height / 2
+
+    this.missionCompleteText = this.add
+      .text(cx, cy - 30, 'MISSION 1 COMPLETE', {
+        fontFamily: 'monospace',
+        fontSize: '54px',
+        color: '#ffc46b',
+        fontStyle: 'bold',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(1002)
+
+    this.missionSubText = this.add
+      .text(cx, cy + 34, 'THE GATES — cleared', {
+        fontFamily: 'monospace',
+        fontSize: '22px',
+        color: '#9fb3d9',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(1002)
+  }
+
 
   openGate() {
     this.gateOpen = true
